@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from invokeai.backend.tiles.utils import TBLR, paste
+from invokeai.backend.tiles.utils import TBLR, paste, seam_blend
 
 
 def test_paste_no_mask_success():
@@ -99,3 +99,44 @@ def test_paste_mask_does_not_match_src_image():
 
     with pytest.raises(ValueError):
         paste(dst_image=dst_image, src_image=src_image, box=box, mask=mask)
+
+
+@pytest.mark.parametrize("x_seam", [False, True])
+def test_seam_blend_seam_follows_low_energy_band(x_seam: bool):
+    """Test that seam_blend() puts the seam on the lowest-energy line.
+
+    The seam's starting position is found with np.argmin() over a slice of the cumulative energy that
+    starts at 'gutter' (ceil(blend_amount / 2)) rather than at index 0, so the result has to be
+    offset back to an absolute index. Without that offset the seam is placed 'gutter' px short of the
+    low-energy line it just found. x_seam rotates the search, so both orientations are covered.
+    """
+    seam_axis_size = 64  # The axis the seam is searched along.
+    other_axis_size = 4
+    blend_amount = 8
+    band_center = 40  # Where the two images agree, i.e. the cheapest place to put the seam.
+
+    # ia2 - ia1 is zero in a narrow band and a high-frequency checkerboard everywhere else, so the
+    # lowest-energy seam is the band. A y-seam searches down columns, an x-seam across rows.
+    shape = (seam_axis_size, other_axis_size) if x_seam else (other_axis_size, seam_axis_size)
+    diff = np.zeros(shape, dtype=np.float64)
+    for y in range(shape[0]):
+        for x in range(shape[1]):
+            if abs((y if x_seam else x) - band_center) > 1:
+                diff[y, x] = 100.0 * ((x + y) % 2)
+
+    ia1 = np.zeros((*shape, 3), dtype=np.float64)
+    ia2 = np.repeat(diff[:, :, None], 3, axis=2)
+
+    blended = seam_blend(ia1, ia2, blend_amount=blend_amount, x_seam=x_seam)
+
+    # blended is ia1 * mask + ia2 * (1 - mask), and ia1 is zeros, so blended is diff * (1 - mask).
+    # Averaging along the other axis cancels the checkerboard and recovers the mask, which is 1 on
+    # one side of the seam and 0 on the other.
+    unblended = diff.mean(axis=1 if x_seam else 0)
+    textured = unblended > 0
+    mask_profile = np.ones(seam_axis_size)
+    mask_profile[textured] = 1.0 - blended.mean(axis=(1, 2) if x_seam else (0, 2))[textured] / unblended[textured]
+
+    past_seam = np.flatnonzero(mask_profile < 0.5)
+    assert len(past_seam) > 0, "the seam mask never transitions from ia1 to ia2"
+    assert abs(int(past_seam[0]) - band_center) <= 2
